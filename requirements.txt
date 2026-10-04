@@ -12,3 +12,4 @@ qdrant-client
 reportlab
 transformers>=4.41
 sentencepiece
+pypdf
