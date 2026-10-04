@@ -571,6 +571,8 @@ def _run_nli_from_claim_verification(
             "lexical_support": None,
             "source": "post_generation_claim_verification",
             "nli": item.get("nli"),
+            "claim_type": item.get("claim_type", "general"),
+            "severity_weight": round(float(item.get("severity_weight") or 1.0), 4),
         }
         for item in claim_results
     ]
@@ -612,6 +614,56 @@ def _aggregate_nli_metadata(nli_claims: list[dict[str, Any]]) -> dict[str, Any]:
         "entailment": round(sum(float(item.get("entailment") or 0.0) for item in enabled_claims) / len(enabled_claims), 4),
         "contradiction": round(max(float(item.get("contradiction") or 0.0) for item in enabled_claims), 4),
         "neutral": round(sum(float(item.get("neutral") or 0.0) for item in enabled_claims) / len(enabled_claims), 4),
+    }
+
+
+def _claim_severity(item: dict[str, Any]) -> float:
+    try:
+        return max(0.1, float(item.get("severity_weight") or 1.0))
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def _weighted_claim_metrics(claim_results: list[dict[str, Any]]) -> dict[str, float]:
+    if not claim_results:
+        return {
+            "weighted_support": 0.0,
+            "weighted_contradiction": 0.0,
+            "weighted_unsupported": 0.0,
+            "weighted_weak_support": 0.0,
+            "entailed_citation_coverage": 0.0,
+        }
+    total = sum(_claim_severity(item) for item in claim_results)
+    if total <= 0:
+        total = float(len(claim_results))
+    support = 0.0
+    contradiction = 0.0
+    unsupported = 0.0
+    weak_support = 0.0
+    citation_coverage = 0.0
+    for item in claim_results:
+        weight = _claim_severity(item)
+        status = item.get("status")
+        support_score = float(item.get("support_score") or 0.0)
+        contradiction_score = float(item.get("contradiction_score") or 0.0)
+        if status == "supported":
+            support += weight
+        elif status == "weak_support":
+            support += 0.5 * weight
+            weak_support += weight
+        else:
+            support += max(0.0, min(support_score, 0.35)) * weight
+        if status in {"unsupported", "insufficient"}:
+            unsupported += weight
+        contradiction += contradiction_score * weight
+        if item.get("best_citation_id") and status in {"supported", "weak_support"}:
+            citation_coverage += weight
+    return {
+        "weighted_support": round(support / total, 4),
+        "weighted_contradiction": round(contradiction / total, 4),
+        "weighted_unsupported": round(unsupported / total, 4),
+        "weighted_weak_support": round(weak_support / total, 4),
+        "entailed_citation_coverage": round(citation_coverage / total, 4),
     }
 
 
@@ -706,6 +758,9 @@ def _calculate_risk_assessment(
     claim_results = (safety_result or {}).get("claim_verification") or []
     confidence = ((safety_result or {}).get("confidence") or {}).get("score")
     confidence_signal = float(confidence) if confidence is not None else None
+    verification_mode = (safety_result or {}).get("verification_mode")
+    emergency = (safety_result or {}).get("emergency") or {}
+    weighted_metrics = _weighted_claim_metrics(claim_results)
     if claim_results:
         support_values = [float(item.get("support_score") or 0.0) for item in claim_results]
         contradiction_values = [float(item.get("contradiction_score") or 0.0) for item in claim_results]
@@ -714,20 +769,24 @@ def _calculate_risk_assessment(
         support_ratio = (supported_count + (0.5 * weak_support_count)) / len(claim_results)
         mean_support = sum(support_values) / len(support_values)
         max_contradiction = max(contradiction_values or [0.0])
+        weighted_support = weighted_metrics["weighted_support"]
+        weighted_contradiction = weighted_metrics["weighted_contradiction"]
     else:
         support_ratio = 0.0
         mean_support = float(nli_confidence or 0.0) if nli_status == "Entailed" else 0.0
         max_contradiction = float(nli_confidence or 0.0) if nli_status == "Contradicted" else 0.0
+        weighted_support = mean_support
+        weighted_contradiction = max_contradiction
 
     if nli_status == "Contradicted":
-        weight = 2.4 + (1.8 * max(float(nli_confidence or 0.0), max_contradiction))
+        weight = 2.4 + (1.8 * max(float(nli_confidence or 0.0), max_contradiction, weighted_contradiction))
         score += weight
         reasons.append("NLI contradiction detected")
     elif nli_status == "Error":
         score += 2.0
         reasons.append("NLI verification failed")
     elif nli_status in {"Neutral", "Insufficient Evidence"}:
-        score += 0.35 + (1.15 * (1.0 - max(mean_support, support_ratio)))
+        score += 0.35 + (1.15 * (1.0 - max(mean_support, support_ratio, weighted_support)))
         reasons.append("NLI support is not conclusive")
 
     if imaging_status == "Mismatch":
@@ -759,47 +818,86 @@ def _calculate_risk_assessment(
         elif rag_score < 0.40:
             reasons.append("Retrieved evidence is borderline")
     if claim_results:
-        unsupported_ratio = len([
-            item for item in claim_results
-            if item.get("status") in {"unsupported", "insufficient"}
-        ]) / len(claim_results)
-        weak_support_ratio = len([
-            item for item in claim_results
-            if item.get("status") == "weak_support"
-        ]) / len(claim_results)
-        score += 1.45 * unsupported_ratio
-        score += 0.55 * weak_support_ratio
+        unsupported_ratio = weighted_metrics["weighted_unsupported"]
+        weak_support_ratio = weighted_metrics["weighted_weak_support"]
+        score += 1.75 * unsupported_ratio
+        score += 0.70 * weak_support_ratio
         if unsupported_ratio:
             reasons.append("Some generated claims are unsupported")
         if weak_support_ratio:
             reasons.append("Some generated claims have weak support")
-        score += 1.8 * max_contradiction if max_contradiction >= 0.55 else 0.35 * max_contradiction
-        if max_contradiction >= 0.55:
+        contradiction_signal = max(max_contradiction, weighted_contradiction)
+        score += 2.0 * contradiction_signal if contradiction_signal >= 0.55 else 0.45 * contradiction_signal
+        if contradiction_signal >= 0.55:
             reasons.append("Claim contradiction signal is elevated")
+        if weighted_metrics["entailed_citation_coverage"] < 0.60:
+            score += 0.65
+            reasons.append("Clinically important claims have incomplete citation coverage")
     if confidence_signal is not None:
         score += max(0.0, 0.70 - confidence_signal) * 1.6
         if confidence_signal < 0.45:
             reasons.append("Clinical confidence score is low")
+
+    if verification_mode == "fallback":
+        score += 1.25
+        reasons.append("NLI fallback verification was used")
+
+    if emergency.get("detected"):
+        score += 1.0
+        reasons.append("Emergency escalation warning was triggered")
 
     if kg_status == "Neutral":
         score += 0.5
         reasons.append("Corpus condition matcher did not match a condition")
 
     if warnings:
-        score += min(1.2, 0.18 * len(warnings))
+        score += min(0.6, 0.10 * len(warnings))
         reasons.append("Verification warnings were generated")
 
-    if score >= 4:
+    contradiction_signal = max(max_contradiction, weighted_contradiction)
+    low_reliability = confidence_signal is not None and confidence_signal < 0.45
+    high_severity_trigger = (
+        imaging_status == "Mismatch"
+        or (critical_findings and imaging_status not in {"Match", "Analyzed"})
+        or weighted_contradiction >= 0.55
+        or (
+            nli_status == "Contradicted"
+            and weighted_contradiction >= 0.35
+            and weighted_metrics["weighted_support"] < 0.50
+        )
+        or (
+            emergency.get("detected")
+            and (
+                rag_verified is False
+                or weighted_metrics["weighted_support"] < 0.20
+                or weighted_metrics["entailed_citation_coverage"] < 0.20
+            )
+        )
+        or (
+            low_reliability
+            and weighted_metrics["weighted_unsupported"] >= 0.75
+            and weighted_metrics["entailed_citation_coverage"] < 0.20
+        )
+    )
+
+    uncapped_score = score
+    tier_score = score if high_severity_trigger else min(score, 3.99)
+
+    if high_severity_trigger and tier_score >= 4:
         tier = "Tier 3"
-    elif score >= 1:
+    elif tier_score >= 1.25:
         tier = "Tier 2"
     else:
         tier = "Tier 1"
 
     return {
         "tier": tier,
-        "score": round(score, 2),
+        "score": round(tier_score, 2),
+        "uncapped_score": round(uncapped_score, 2),
         "reasons": reasons,
+        "weighted_claim_metrics": weighted_metrics,
+        "risk_model": "severity_weighted_interpretable_v2",
+        "high_severity_trigger": bool(high_severity_trigger),
     }
 
 
@@ -826,6 +924,10 @@ def _build_final_assessment(
         recommendation = "Retrieved evidence is weak or insufficient; cross-check before use."
     if claims_summary.get("unsupported") or claims_summary.get("insufficient") or claims_summary.get("weak_support"):
         recommendation = "Some claims lack strong evidence match; review claim details and citations."
+    if (safety_result or {}).get("verification_mode") == "fallback":
+        recommendation = "DeBERTa-v3 NLI was unavailable; review fallback-verified claims before relying on this response."
+    if ((safety_result or {}).get("emergency") or {}).get("detected"):
+        recommendation = "Urgent symptoms were detected; seek emergency medical care immediately."
     return {
         "verdict": verdict,
         "recommendation": recommendation,
@@ -833,6 +935,9 @@ def _build_final_assessment(
         "risk_score": risk_assessment.get("score"),
         "confidence_label": confidence.get("label"),
         "confidence_score": confidence.get("score"),
+        "reliability_score": confidence.get("reliability_score", confidence.get("score")),
+        "clinical_risk_score": risk_assessment.get("score"),
+        "scoring_model": risk_assessment.get("risk_model"),
         "nli_label": nli_label,
         "rag_verified": rag_verified,
         "warnings_count": len(warnings),
@@ -888,6 +993,8 @@ def verify_response(
     all_warnings.extend(nli_warnings)
 
     all_warnings.extend((safety_result or {}).get("warnings", []))
+    if (safety_result or {}).get("verification_mode") == "fallback":
+        all_warnings.append("Verification mode: fallback because DeBERTa-v3 MNLI was unavailable.")
 
     imaging_status, imaging_warnings = _run_imaging_verification(
         response, imaging_result, matched_conditions
@@ -936,6 +1043,9 @@ def verify_response(
         citations_count=len(citations),
     )
     nli_metadata = _aggregate_nli_metadata(nli_claims)
+    verification_mode = (safety_result or {}).get("verification_mode") or (
+        "nli" if nli_metadata.get("enabled") else "local"
+    )
 
     return {
         "risk_tier": risk_tier,
@@ -944,10 +1054,17 @@ def verify_response(
             "label": nli_label,
             "confidence": nli_confidence,
             "claims": nli_claims,
+            "verification_mode": verification_mode,
             **nli_metadata,
         },
+        "verification_mode": verification_mode,
+        "verified_claim_count": (safety_result or {}).get("verified_claim_count", len(nli_claims)),
+        "total_claim_count": (safety_result or {}).get("total_claim_count", len(nli_claims)),
         "risk_score": risk_assessment["score"],
+        "uncapped_risk_score": risk_assessment.get("uncapped_score"),
         "risk_reasons": risk_assessment["reasons"],
+        "risk_model": risk_assessment.get("risk_model"),
+        "weighted_claim_metrics": risk_assessment.get("weighted_claim_metrics", {}),
         "final_assessment": final_assessment,
         "rag_score": rag_score,
         "rag_verified": rag_verified,
