@@ -72,8 +72,8 @@ def build_report_data(payload: dict[str, Any]) -> dict[str, Any]:
     Normalize a HalluGuard-Med response payload into a report-friendly shape.
 
     This module intentionally does not call MedGemma, RAG, Qdrant, verification,
-    radiology, or confidence scoring. It only formats fields already returned by
-    the existing chat endpoint and submitted by the frontend.
+    radiology, or confidence scoring. Report routes must pass server-stored chat
+    payloads rather than trusting client-submitted analysis fields.
     """
     analysis = _as_dict(payload.get("analysis"))
     confidence = _as_dict(analysis.get("confidence"))
@@ -161,6 +161,9 @@ def build_report_data(payload: dict[str, Any]) -> dict[str, Any]:
             "kg": analysis.get("kg", "N/A"),
             "nli": nli.get("label", "N/A"),
             "nli_confidence": _percent(nli.get("confidence")),
+            "verification_mode": analysis.get("verification_mode") or nli.get("verification_mode", "N/A"),
+            "verified_claim_count": analysis.get("verified_claim_count", "N/A"),
+            "total_claim_count": analysis.get("total_claim_count", "N/A"),
             "rag_score": _percent(analysis.get("rag_score")),
             "rag_verified": analysis.get("rag_verified", "N/A"),
             "rag_error": analysis.get("rag_error"),
