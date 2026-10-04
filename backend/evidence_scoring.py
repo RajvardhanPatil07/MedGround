@@ -34,6 +34,25 @@ LOW_EVIDENCE_PREFIXES = (
     "also called:",
 )
 
+HIGH_VALUE_SECTION_TERMS = (
+    "symptom",
+    "diagnosis",
+    "treatment",
+    "prevention",
+    "complication",
+    "emergency",
+    "when to seek",
+    "management",
+    "cause",
+    "risk",
+)
+
+LOW_VALUE_SECTION_TERMS = (
+    "alias",
+    "related",
+    "topic group",
+)
+
 
 def _normalized_disease_terms(entities: list[MedicalEntity]) -> set[str]:
     return {
@@ -206,6 +225,44 @@ def _matched_query_terms(query_text: str, hit: dict[str, Any]) -> tuple[list[str
     return matched, missing
 
 
+def _section_usefulness(hit: dict[str, Any]) -> float:
+    section = str(hit.get("section") or "").lower()
+    text = str(hit.get("text") or "").strip().lower()
+    if any(term in section for term in HIGH_VALUE_SECTION_TERMS):
+        return 0.92
+    if any(term in section for term in LOW_VALUE_SECTION_TERMS):
+        return 0.35
+    if text.startswith(LOW_EVIDENCE_PREFIXES):
+        return 0.30
+    return 0.68
+
+
+def _specificity_score(hit: dict[str, Any], matched_terms: list[str]) -> float:
+    text = str(hit.get("text") or "")
+    token_count = len(re.findall(r"[a-z0-9]+", text.lower()))
+    if token_count <= 12:
+        length_signal = 0.25
+    elif token_count <= 35:
+        length_signal = 0.55
+    elif token_count <= 160:
+        length_signal = 0.88
+    else:
+        length_signal = 0.72
+    match_signal = min(1.0, len(matched_terms) / 5.0)
+    return round((0.65 * length_signal) + (0.35 * match_signal), 4)
+
+
+def _source_consistency(citation_id: str, conflicts: list[SourceConflict]) -> float:
+    if not conflicts:
+        return 1.0
+    highest = 0.0
+    for conflict in conflicts:
+        if citation_id not in {conflict.citation_a, conflict.citation_b}:
+            continue
+        highest = max(highest, 1.0 if conflict.severity == "high" else 0.6)
+    return round(max(0.0, 1.0 - highest), 4)
+
+
 @dataclass(frozen=True)
 class EvidenceScore:
     citation_id: str
@@ -213,8 +270,12 @@ class EvidenceScore:
     retrieval_score: float
     entity_overlap: float
     lexical_relevance: float
+    semantic_relevance: float
     source_authority: float
+    section_usefulness: float
+    specificity_score: float
     recency_score: float
+    source_consistency: float
     contradiction_penalty: float
     final_score: float
     passed: bool
@@ -261,17 +322,23 @@ class EvidenceScorer:
             semantic_relevance = _semantic_relevance(query_text, hit)
             matched_terms, missing_terms = _matched_query_terms(query_text, hit)
             contradiction_penalty = conflict_penalties.get(citation_id, 0.0)
+            section_usefulness = _section_usefulness(hit)
+            specificity_score = _specificity_score(hit, matched_terms)
+            source_consistency = _source_consistency(citation_id, conflicts or [])
             disease_terms = _normalized_disease_terms(query_entities)
             condition_alignment = _condition_aligned(hit, disease_terms)
 
             final_score = (
-                (0.24 * retrieval_score)
-                + (0.18 * entity_overlap)
-                + (0.18 * lexical_relevance)
-                + (0.16 * semantic_relevance)
+                (0.18 * retrieval_score)
+                + (0.14 * entity_overlap)
+                + (0.14 * lexical_relevance)
+                + (0.14 * semantic_relevance)
                 + (0.16 * source_authority)
-                + (0.08 * recency_score)
-                - (0.10 * contradiction_penalty)
+                + (0.09 * section_usefulness)
+                + (0.07 * specificity_score)
+                + (0.05 * recency_score)
+                + (0.08 * source_consistency)
+                - (0.12 * contradiction_penalty)
             )
             if condition_alignment is True:
                 final_score += 0.12
@@ -305,6 +372,12 @@ class EvidenceScorer:
                 reasons.append("low_lexical_relevance")
             if semantic_relevance >= 0.55:
                 reasons.append("semantic_relevance_match")
+            if section_usefulness < 0.45:
+                reasons.append("low_value_section")
+            if specificity_score < 0.45:
+                reasons.append("low_specificity")
+            if source_consistency < 1.0:
+                reasons.append("source_consistency_penalty")
             if condition_alignment is True:
                 reasons.append("condition_aligned")
             elif condition_alignment is False:
@@ -318,8 +391,12 @@ class EvidenceScorer:
                 retrieval_score=round(retrieval_score, 4),
                 entity_overlap=round(entity_overlap, 4),
                 lexical_relevance=round(lexical_relevance, 4),
+                semantic_relevance=round(semantic_relevance, 4),
                 source_authority=round(source_authority, 4),
+                section_usefulness=round(section_usefulness, 4),
+                specificity_score=round(specificity_score, 4),
                 recency_score=round(recency_score, 4),
+                source_consistency=round(source_consistency, 4),
                 contradiction_penalty=round(contradiction_penalty, 4),
                 final_score=final_score,
                 passed=final_score >= self.threshold,
