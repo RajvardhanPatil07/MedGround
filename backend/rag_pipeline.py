@@ -26,6 +26,7 @@ def build_grounded_context(hits: list[dict[str, Any]]) -> str:
     for hit in hits:
         blocks.append(
             "\n".join([
+
                 f"Source: {hit['source']}",
                 f"Condition: {hit['condition']}",
                 f"Section: {hit['section']}",
