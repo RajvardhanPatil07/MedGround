@@ -58,6 +58,10 @@ def _build_claims_summary(claim_rows: list[dict[str, Any]]) -> dict[str, Any]:
     total = len(claim_rows)
     by_status: dict[str, int] = {}
     support_scores = []
+    weighted_support = 0.0
+    weighted_contradiction = 0.0
+    weighted_citation_coverage = 0.0
+    severity_total = 0.0
     supported_with_citations = 0
     for row in claim_rows:
         status = str(row.get("status") or "unknown")
@@ -65,7 +69,23 @@ def _build_claims_summary(claim_rows: list[dict[str, Any]]) -> dict[str, Any]:
         if status == "supported" and row.get("best_citation_id"):
             supported_with_citations += 1
         try:
-            support_scores.append(float(row.get("support_score") or 0.0))
+            severity_weight = max(0.1, float(row.get("severity_weight") or 1.0))
+        except (TypeError, ValueError):
+            severity_weight = 1.0
+        severity_total += severity_weight
+        try:
+            support_score = float(row.get("support_score") or 0.0)
+            contradiction_score = float(row.get("contradiction_score") or 0.0)
+            support_scores.append(support_score)
+            if status == "supported":
+                weighted_support += severity_weight
+            elif status == "weak_support":
+                weighted_support += 0.5 * severity_weight
+            else:
+                weighted_support += max(0.0, min(support_score, 0.35)) * severity_weight
+            weighted_contradiction += contradiction_score * severity_weight
+            if row.get("best_citation_id") and status in {"supported", "weak_support"}:
+                weighted_citation_coverage += severity_weight
         except (TypeError, ValueError):
             pass
     return {
@@ -77,6 +97,10 @@ def _build_claims_summary(claim_rows: list[dict[str, Any]]) -> dict[str, Any]:
         "contradicted": by_status.get("contradicted", 0),
         "mean_support": round(sum(support_scores) / len(support_scores), 4) if support_scores else 0.0,
         "citation_coverage": round(supported_with_citations / total, 4) if total else 0.0,
+        "weighted_claim_support": round(weighted_support / severity_total, 4) if severity_total else 0.0,
+        "weighted_contradiction_risk": round(weighted_contradiction / severity_total, 4) if severity_total else 0.0,
+        "entailed_citation_coverage": round(weighted_citation_coverage / severity_total, 4) if severity_total else 0.0,
+        "severity_weight_total": round(severity_total, 4),
         "by_status": by_status,
     }
 
@@ -177,9 +201,11 @@ def run_post_generation_safety(
         filtered_hits = [imaging_evidence, *filtered_hits]
     claim_start = perf_counter()
     claims = _claim_verifier.extract_claims(answer)
+    total_claim_count = len(claims)
     claim_extraction_duration_ms = round((perf_counter() - claim_start) * 1000.0, 2)
     nli_start = perf_counter()
     claim_results = _claim_verifier.verify_claims(claims, filtered_hits)
+    verification_mode = _claim_verifier.last_verification_mode
     nli_duration_ms = round((perf_counter() - nli_start) * 1000.0, 2)
 
     # Rehydrate lightweight dict data into the dataclasses expected by the fusion layer.
@@ -193,11 +219,19 @@ def run_post_generation_safety(
         claim_results=claim_results,
         imaging_result=imaging_result,
     )
+    confidence_payload = confidence.to_dict()
+    if verification_mode == "fallback":
+        confidence_payload["score"] = round(min(float(confidence_payload.get("score") or 0.0), 0.44), 4)
+        confidence_payload["label"] = "low" if confidence_payload["score"] < 0.45 else "medium"
+        confidence_payload["should_answer"] = False
+        confidence_payload.setdefault("reasons", []).append("nli_fallback_verification_used")
 
     warnings = []
-    if confidence.should_refuse:
+    if verification_mode == "fallback":
+        warnings.append("DeBERTa-v3 MNLI was unavailable; fallback claim verification was used.")
+    if confidence_payload.get("should_refuse"):
         warnings.append("Clinical safety layer recommends refusing this answer.")
-    elif not confidence.should_answer:
+    elif not confidence_payload.get("should_answer"):
         warnings.append("Clinical safety layer found insufficient support for a confident answer.")
     unsupported_claims = [
         row for row in claim_rows
@@ -217,8 +251,9 @@ def run_post_generation_safety(
         nli_verification_duration_ms=nli_duration_ms,
         claims_count=len(claims),
         confidence_score=confidence.score,
-        confidence_label=confidence.label,
-        should_refuse=confidence.should_refuse,
+        confidence_label=confidence_payload.get("label"),
+        should_refuse=confidence_payload.get("should_refuse"),
+        verification_mode=verification_mode,
     )
 
     return {
@@ -226,7 +261,10 @@ def run_post_generation_safety(
         "claims": claims_to_dicts(claims),
         "claims_summary": claims_summary,
         "claim_verification": claim_rows,
-        "confidence": confidence.to_dict(),
+        "confidence": confidence_payload,
+        "verification_mode": verification_mode,
+        "verified_claim_count": len(claim_results),
+        "total_claim_count": total_claim_count,
         "warnings": warnings,
     }
 
