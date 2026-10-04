@@ -8,10 +8,12 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
 try:
+    from .case_store import get_case
     from .pdf_templates import generate_pdf
     from .report_generator import build_report_data
     from .structured_log import log_event
 except ImportError:
+    from case_store import get_case
     from pdf_templates import generate_pdf
     from report_generator import build_report_data
     from structured_log import log_event
@@ -23,17 +25,20 @@ router = APIRouter(prefix="/api", tags=["reports"])
 @router.post("/download-report")
 async def download_report(payload: dict[str, Any]) -> StreamingResponse:
     """
-    Generate a HalluGuard-Med PDF report from an existing chat response payload.
+    Generate a HalluGuard-Med PDF report from a server-stored chat case.
 
-    This endpoint performs report formatting only. It does not invoke or alter the
-    MedGemma, RAG, Qdrant, verification, confidence, or radiology pipelines.
+    Client-submitted risk/confidence/claim fields are ignored. The report is
+    built only from the verified response stored by /api/chat for the case_id.
     """
-    if not isinstance(payload, dict) or not payload.get("analysis"):
-        raise HTTPException(status_code=400, detail="Valid HalluGuard analysis payload is required.")
+    if not isinstance(payload, dict) or not payload.get("case_id"):
+        raise HTTPException(status_code=400, detail="A valid case_id is required.")
+    stored_payload = get_case(str(payload["case_id"]))
+    if stored_payload is None:
+        raise HTTPException(status_code=404, detail="No server-stored report data found for this case_id.")
 
     report_start = perf_counter()
     build_start = perf_counter()
-    report = build_report_data(payload)
+    report = build_report_data(stored_payload)
     build_duration_ms = round((perf_counter() - build_start) * 1000.0, 2)
     pdf_start = perf_counter()
     pdf_bytes = generate_pdf(report)

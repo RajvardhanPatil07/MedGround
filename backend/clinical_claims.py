@@ -5,6 +5,7 @@ Clinical claim extraction and evidence verification.
 from __future__ import annotations
 
 import re
+import os
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -32,7 +33,7 @@ except ImportError:
     from structured_log import log_event
 
 
-MAX_CLAIMS = 6
+MAX_CLAIMS = int(os.getenv("MAX_CLAIMS", "10"))
 MAX_EVIDENCE_PER_CLAIM = 4
 MAX_EVIDENCE_WINDOWS_PER_CLAIM = 3
 MAX_EVIDENCE_WINDOW_CHARS = 520
@@ -43,6 +44,18 @@ SUPPORTED_THRESHOLD = 0.60
 WEAK_SUPPORT_THRESHOLD = 0.40
 UNSUPPORTED_THRESHOLD = WEAK_SUPPORT_THRESHOLD
 LEXICAL_SUPPORT_THRESHOLD = 0.46
+
+CLAIM_SEVERITY_WEIGHTS = {
+    "emergency_triage": 2.0,
+    "diagnosis": 1.8,
+    "medication_or_dosage": 1.8,
+    "treatment": 1.6,
+    "contraindication_or_adverse_effect": 1.5,
+    "risk_or_complication": 1.4,
+    "prognosis": 1.2,
+    "symptom": 1.0,
+    "general": 0.7,
+}
 
 UNSAFE_PHRASES = [
     "guaranteed to cure",
@@ -88,6 +101,21 @@ GENERIC_CLAIM_PATTERNS = [
     r"\b(use this output|decision support|not a final diagnosis)\b",
 ]
 
+SAFETY_OR_POLICY_CLAIM_PATTERNS = [
+    r"\burgent safety warning\b",
+    r"\bdo not rely on\b.*\b(ai|assistant|model|response|answer|output)\b",
+    r"\b(ai|assistant|model|response|answer|output)\b.*\bdoes not replace\b",
+    r"\bnot a final diagnosis\b",
+    r"\bdecision support only\b",
+    r"\bnot a substitute for\b.*\bmedical advice\b",
+    r"\bprofessional medical advice\b",
+    r"\bconsult (?:a |your )?(?:licensed )?(?:clinician|doctor|physician|health ?care provider|medical professional)\b",
+    r"\btalk to (?:a |your )?(?:clinician|doctor|physician|health ?care provider)\b",
+    r"\bplease (?:consult|seek|talk to)\b",
+    r"\bseek (?:urgent|emergency|immediate) medical care\b",
+    r"\bcall (?:911|your local emergency number|emergency services)\b",
+]
+
 DOMAIN_PHRASES = (
     "a1c",
     "appendicitis",
@@ -113,6 +141,21 @@ DOMAIN_PHRASES = (
     "pregnancy",
     "injection",
 )
+
+CLAIM_TYPE_PATTERNS = [
+    ("emergency_triage", r"\b(emergency|urgent|call\s+911|go to (?:the )?er|seek emergency|immediate medical)\b"),
+    ("medication_or_dosage", r"\b(dose|dosage|mg|milligram|tablet|capsule|insulin|antibiotic|medication|medicine|drug|prescription)\b"),
+    ("contraindication_or_adverse_effect", r"\b(side effect|adverse|contraindicat|avoid|allergic|interaction|harmful|toxicity|overdose)\b"),
+    ("diagnosis", r"\b(diagnos|diagnosis|diagnosed|indicates|suggests|consistent with|rules out|rule out)\b"),
+    ("treatment", r"\b(treat|treatment|therapy|surgery|procedure|manage|management|lifestyle|exercise|diet)\b"),
+    ("risk_or_complication", r"\b(risk|complication|can lead to|can cause|may cause|worsen|progression|rupture|stroke|attack)\b"),
+    ("prognosis", r"\b(prognosis|outlook|recover|recovery|long[- ]term|survival|prevent or delay)\b"),
+    ("symptom", r"\b(symptom|sign|pain|fever|cough|nausea|vomit|weakness|shortness of breath|bleeding)\b"),
+]
+
+
+def claim_severity_weight(claim_type: str) -> float:
+    return CLAIM_SEVERITY_WEIGHTS.get(claim_type, CLAIM_SEVERITY_WEIGHTS["general"])
 
 CONCEPT_SYNONYMS = {
     "rupture": "burst",
@@ -269,6 +312,7 @@ class ClinicalClaim:
     text: str
     claim_type: str
     entities: list[MedicalEntity]
+    severity_weight: float = CLAIM_SEVERITY_WEIGHTS["general"]
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -290,6 +334,8 @@ class ClaimVerificationResult:
     matched_concepts: list[str] = field(default_factory=list)
     missing_concepts: list[str] = field(default_factory=list)
     nli: dict[str, Any] = field(default_factory=disabled_metadata)
+    claim_type: str = "general"
+    severity_weight: float = CLAIM_SEVERITY_WEIGHTS["general"]
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -491,6 +537,21 @@ def _split_evidence_windows(text: str, max_chars: int = MAX_EVIDENCE_WINDOW_CHAR
     if not sentences:
         return []
     windows: list[str] = []
+
+    def add_window(value: str) -> None:
+        value = re.sub(r"\s+", " ", value).strip()
+        if not value:
+            return
+        if len(value) > max_chars:
+            trimmed = value[:max_chars].rsplit(" ", 1)[0].strip()
+            value = trimmed or value[:max_chars].strip()
+        windows.append(value)
+
+    for sentence in sentences:
+        add_window(sentence)
+    for index in range(len(sentences) - 1):
+        add_window(f"{sentences[index]} {sentences[index + 1]}")
+
     current = ""
     for sentence in sentences:
         candidate = f"{current} {sentence}".strip() if current else sentence
@@ -498,29 +559,33 @@ def _split_evidence_windows(text: str, max_chars: int = MAX_EVIDENCE_WINDOW_CHAR
             current = candidate
             continue
         if current:
-            windows.append(current)
+            add_window(current)
         current = sentence
     if current:
-        windows.append(current)
-    return windows
+        add_window(current)
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for window in windows:
+        key = re.sub(r"\W+", " ", window.lower()).strip()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(window)
+    return deduped[:24]
 
 
 def _claim_type(text: str) -> str:
-    lowered = text.lower()
-    if any(word in lowered for word in ("treat", "therapy", "medicine", "drug", "dose")):
-        return "treatment"
-    if any(word in lowered for word in ("diagnos", "test", "scan", "x-ray", "ct", "mri")):
-        return "diagnosis"
-    if any(word in lowered for word in ("risk", "contraindicat", "avoid", "unsafe")):
-        return "risk"
-    if any(word in lowered for word in ("symptom", "sign", "present")):
-        return "symptom"
+    for label, pattern in CLAIM_TYPE_PATTERNS:
+        if re.search(pattern, text, re.IGNORECASE):
+            return label
     return "general"
 
 
 class ClinicalClaimVerifier:
     def __init__(self, extractor: MedicalEntityExtractor | None = None) -> None:
         self.extractor = extractor or MedicalEntityExtractor()
+        self.last_verification_mode = "unknown"
 
     def extract_claims(self, answer: str) -> list[ClinicalClaim]:
         answer = self._strip_citation_appendix(answer)
@@ -532,15 +597,19 @@ class ClinicalClaimVerifier:
                 continue
             if self._is_low_value_image_claim(sentence):
                 continue
+            if self._is_safety_or_policy_claim(sentence):
+                continue
             if self._is_generic_claim(sentence):
                 continue
             if len(_concept_terms(sentence)) < 2:
                 continue
             claim_id = f"C{len(claims) + 1}"
+            claim_type = _claim_type(sentence)
             claims.append(ClinicalClaim(
                 claim_id=claim_id,
                 text=sentence,
-                claim_type=_claim_type(sentence),
+                claim_type=claim_type,
+                severity_weight=claim_severity_weight(claim_type),
                 entities=self.extractor.extract(sentence, source=claim_id),
             ))
             if len(claims) >= MAX_CLAIMS:
@@ -561,14 +630,30 @@ class ClinicalClaimVerifier:
     def _is_generic_claim(self, sentence: str) -> bool:
         return any(re.search(pattern, sentence, re.IGNORECASE) for pattern in GENERIC_CLAIM_PATTERNS)
 
+    def _is_safety_or_policy_claim(self, sentence: str) -> bool:
+        lowered = sentence.lower()
+        dangerous_negation = re.search(
+            r"\b(?:do not|don't|avoid|no need to)\s+(?:seek|consult|call|go to|contact)\b",
+            lowered,
+        )
+        if dangerous_negation:
+            return False
+        return any(
+            re.search(pattern, sentence, re.IGNORECASE)
+            for pattern in SAFETY_OR_POLICY_CLAIM_PATTERNS
+        )
+
     def verify_claims(
         self,
         claims: list[ClinicalClaim],
         evidence_hits: list[dict[str, Any]],
     ) -> list[ClaimVerificationResult]:
+        self.last_verification_mode = "nli"
         if not claims:
+            self.last_verification_mode = "none"
             return []
         if any(phrase in " ".join(claim.text.lower() for claim in claims) for phrase in UNSAFE_PHRASES):
+            self.last_verification_mode = "rule"
             return [
                 ClaimVerificationResult(
                     claim_id=claims[0].claim_id,
@@ -580,9 +665,12 @@ class ClinicalClaimVerifier:
                     best_evidence=None,
                     reason="unsafe_absolute_medical_claim",
                     support_breakdown={"unsafe_phrase": 1.0},
+                    claim_type=claims[0].claim_type,
+                    severity_weight=claims[0].severity_weight,
                 )
             ]
         if not evidence_hits:
+            self.last_verification_mode = "insufficient_evidence"
             return [
                 ClaimVerificationResult(
                     claim_id=claim.claim_id,
@@ -594,6 +682,8 @@ class ClinicalClaimVerifier:
                     best_evidence=None,
                     reason="no_evidence_available",
                     support_breakdown={},
+                    claim_type=claim.claim_type,
+                    severity_weight=claim.severity_weight,
                 )
                 for claim in claims
             ]
@@ -604,6 +694,7 @@ class ClinicalClaimVerifier:
             # is retained as a fail-open server-safe fallback.
             return self._verify_with_nli(claims, evidence_hits)
         except NliUnavailableError as exc:
+            self.last_verification_mode = "fallback"
             log_event(
                 "nli",
                 "claim_verification_fallback",
@@ -647,6 +738,117 @@ class ClinicalClaimVerifier:
                 best_hit = hit
         return round(best_score, 4), best_hit
 
+    def _score_candidate_support(
+        self,
+        claim: ClinicalClaim,
+        hit: dict[str, Any],
+        primary_conditions: set[str],
+    ) -> dict[str, Any]:
+        citation_id = str(hit.get("citation_id", ""))
+        premise_text = str(hit.get("_premise_text") or hit.get("text") or "")
+        if not premise_text:
+            return {
+                "support": 0.0,
+                "hit": hit,
+                "premise_text": "",
+                "breakdown": {},
+                "matched": [],
+                "missing": [],
+            }
+
+        hit_entities = self.extractor.extract(premise_text, source=citation_id)
+        overlap = self.extractor.entity_overlap(claim.entities, hit_entities)
+        lexical = _lexical_support_score(claim.text, premise_text)
+        concept, matched, missing = _concept_coverage(claim.text, premise_text)
+        semantic = _semantic_support_score(claim.text, premise_text, overlap, concept, lexical)
+        condition_alignment = _condition_alignment_score(claim.text, hit, primary_conditions)
+        retrieval = float(hit.get("normalized_score") or hit.get("score") or 0.0)
+        retrieval = min(1.0, max(0.0, retrieval))
+
+        support = (
+            (0.22 * lexical)
+            + (0.30 * concept)
+            + (0.18 * semantic)
+            + (0.15 * overlap)
+            + (0.10 * condition_alignment)
+            + (0.05 * retrieval)
+        )
+        if condition_alignment <= 0.0:
+            support = 0.0
+        elif semantic >= 0.70 and condition_alignment >= 0.5:
+            support = max(support, 0.62)
+        elif semantic >= 0.55 and condition_alignment >= 0.5:
+            support = max(support, 0.45)
+        if concept >= 0.70 and lexical >= 0.45 and condition_alignment >= 0.5:
+            support = max(support, 0.68)
+        elif concept >= 0.55 and semantic >= 0.62 and condition_alignment >= 0.5:
+            support = max(support, 0.60)
+        if concept < 0.30 and lexical < 0.35 and semantic < 0.45:
+            support *= 0.55
+
+        return {
+            "support": round(min(1.0, max(0.0, support)), 4),
+            "hit": hit,
+            "premise_text": premise_text,
+            "breakdown": {
+                "lexical": round(lexical, 4),
+                "concept_coverage": round(concept, 4),
+                "semantic": round(semantic, 4),
+                "entity_overlap": round(overlap, 4),
+                "condition_alignment": round(condition_alignment, 4),
+                "retrieval": round(retrieval, 4),
+            },
+            "matched": matched,
+            "missing": missing[:8],
+        }
+
+    def _support_reason(self, breakdown: dict[str, float]) -> str:
+        semantic = breakdown.get("semantic", 0.0)
+        concept = breakdown.get("concept_coverage", 0.0)
+        lexical = breakdown.get("lexical", 0.0)
+        overlap = breakdown.get("entity_overlap", 0.0)
+        if semantic >= 0.55:
+            return "semantic_concept_support"
+        if concept >= 0.5:
+            return "concept_and_lexical_support"
+        if lexical >= overlap:
+            return "lexical_evidence_support"
+        return "entity_overlap_fallback"
+
+    def _best_local_support(
+        self,
+        claim: ClinicalClaim,
+        candidate_hits: list[dict[str, Any]],
+        primary_conditions: set[str],
+    ) -> dict[str, Any]:
+        best: dict[str, Any] | None = None
+        for hit in candidate_hits:
+            scored = self._score_candidate_support(claim, hit, primary_conditions)
+            if best is None or scored["support"] > best["support"]:
+                best = scored
+        if best is not None:
+            return best
+        return {
+            "support": 0.0,
+            "hit": None,
+            "premise_text": None,
+            "breakdown": {},
+            "matched": [],
+            "missing": [],
+        }
+
+    def _window_rank_score(
+        self,
+        claim: ClinicalClaim,
+        hit: dict[str, Any],
+        window: str,
+        primary_conditions: set[str],
+    ) -> float:
+        clone = dict(hit)
+        clone["_premise_text"] = window
+        scored = self._score_candidate_support(claim, clone, primary_conditions)
+        return float(scored.get("support") or 0.0)
+
     def _select_evidence_for_claim(
         self,
         claim: ClinicalClaim,
@@ -660,15 +862,10 @@ class ClinicalClaimVerifier:
             condition_alignment = _condition_alignment_score(claim.text, hit, primary_conditions)
             if condition_alignment <= 0.0:
                 continue
-            hit_entities = self.extractor.extract(
-                hit.get("text", ""),
-                source=str(hit.get("citation_id", "")),
-            )
-            overlap = self.extractor.entity_overlap(claim.entities, hit_entities)
-            lexical = _lexical_support_score(claim.text, hit.get("text", ""))
+            local = self._score_candidate_support(claim, hit, primary_conditions)
             source_bonus = 0.25 if hit.get("source_type") == "radiology_model" else 0.0
             rank_bonus = max(0.0, 0.10 - (index * 0.01))
-            scored.append((max(overlap, lexical) + source_bonus + rank_bonus + (0.20 * condition_alignment), hit))
+            scored.append((float(local["support"]) + source_bonus + rank_bonus, hit))
 
         ranked = [hit for score, hit in sorted(scored, key=lambda item: item[0], reverse=True) if score > 0]
         candidates = ranked[:MAX_EVIDENCE_PER_CLAIM]
@@ -687,7 +884,7 @@ class ClinicalClaimVerifier:
                 continue
             ranked_windows = sorted(
                 windows,
-                key=lambda window: _lexical_support_score(claim.text, window),
+                key=lambda window: self._window_rank_score(claim, hit, window, primary_conditions),
                 reverse=True,
             )
             for window in ranked_windows[:2]:
@@ -703,10 +900,6 @@ class ClinicalClaimVerifier:
         claims: list[ClinicalClaim],
         evidence_hits: list[dict[str, Any]],
     ) -> list[ClaimVerificationResult]:
-        evidence_entities = {
-            str(hit.get("citation_id", "")): self.extractor.extract(hit.get("text", ""), source=str(hit.get("citation_id", "")))
-            for hit in evidence_hits[:MAX_EVIDENCE_PER_CLAIM]
-        }
         results = []
         primary_conditions = _primary_conditions(evidence_hits)
         for claim in claims:
@@ -721,49 +914,15 @@ class ClinicalClaimVerifier:
                 results.append(self._insufficient_result(claim, "no_condition_aligned_evidence"))
                 continue
             for hit in candidate_hits:
-                citation_id = str(hit.get("citation_id", ""))
-                premise_text = hit.get("_premise_text") or hit.get("text", "")
-                hit_entities = evidence_entities.get(citation_id)
-                if hit_entities is None or hit.get("_premise_text"):
-                    hit_entities = self.extractor.extract(premise_text, source=citation_id)
-                overlap = self.extractor.entity_overlap(claim.entities, hit_entities)
-                lexical = _lexical_support_score(claim.text, premise_text)
-                concept, matched, missing = _concept_coverage(claim.text, premise_text)
-                semantic = _semantic_support_score(claim.text, premise_text, overlap, concept, lexical)
-                condition_alignment = _condition_alignment_score(claim.text, hit, primary_conditions)
-                retrieval = float(hit.get("normalized_score") or hit.get("score") or 0.0)
-                support = (
-                    (0.22 * lexical)
-                    + (0.30 * concept)
-                    + (0.18 * semantic)
-                    + (0.15 * overlap)
-                    + (0.10 * condition_alignment)
-                    + (0.05 * min(1.0, retrieval))
-                )
-                if semantic >= 0.70 and condition_alignment >= 0.5:
-                    support = max(support, 0.62)
-                elif semantic >= 0.55 and condition_alignment >= 0.5:
-                    support = max(support, 0.45)
-                if concept < 0.30 and lexical < 0.35 and semantic < 0.45:
-                    support *= 0.55
+                scored = self._score_candidate_support(claim, hit, primary_conditions)
+                support = float(scored["support"])
                 if support > best_support:
                     best_support = support
                     best_hit = hit
-                    best_reason = "semantic_concept_support" if semantic >= 0.55 else (
-                        "concept_and_lexical_support" if concept >= 0.5 else (
-                            "lexical_evidence_support" if lexical >= overlap else "entity_overlap_fallback"
-                        )
-                    )
-                    best_breakdown = {
-                        "lexical": round(lexical, 4),
-                        "concept_coverage": round(concept, 4),
-                        "semantic": round(semantic, 4),
-                        "entity_overlap": round(overlap, 4),
-                        "condition_alignment": round(condition_alignment, 4),
-                        "retrieval": round(min(1.0, retrieval), 4),
-                    }
-                    best_matched = matched
-                    best_missing = missing[:8]
+                    best_reason = self._support_reason(scored["breakdown"])
+                    best_breakdown = scored["breakdown"]
+                    best_matched = scored["matched"]
+                    best_missing = scored["missing"]
             status = classify_support_status(best_support)
             results.append(ClaimVerificationResult(
                 claim_id=claim.claim_id,
@@ -772,11 +931,18 @@ class ClinicalClaimVerifier:
                 support_score=round(best_support, 4),
                 contradiction_score=0.0,
                 best_citation_id=best_hit.get("citation_id") if best_hit else None,
-                best_evidence=best_hit.get("text") if best_hit else None,
+                best_evidence=(best_hit.get("_premise_text") or best_hit.get("text")) if best_hit else None,
                 reason=best_reason,
                 support_breakdown=best_breakdown,
                 matched_concepts=best_matched[:10],
                 missing_concepts=best_missing,
+                nli={
+                    **disabled_metadata(),
+                    "verification_mode": "fallback",
+                    "fallback_reason": "nli_unavailable",
+                },
+                claim_type=claim.claim_type,
+                severity_weight=claim.severity_weight,
             ))
         return results
 
@@ -786,42 +952,97 @@ class ClinicalClaimVerifier:
         evidence_hits: list[dict[str, Any]],
     ) -> list[ClaimVerificationResult]:
         results: list[ClaimVerificationResult] = []
+        primary_conditions = _primary_conditions(evidence_hits)
         for claim in claims:
             candidate_hits = self._select_evidence_for_claim(claim, evidence_hits)[:3]
             if not candidate_hits:
                 results.append(self._insufficient_result(claim, "no_condition_aligned_evidence"))
                 continue
+            local_best = self._best_local_support(claim, candidate_hits, primary_conditions)
+            local_support = float(local_best.get("support") or 0.0)
+            local_breakdown = local_best.get("breakdown") or {}
+            local_hit = local_best.get("hit") or {}
 
             nli_result = verify_claim_against_evidence(
                 claim.text,
                 candidate_hits,
                 max_evidence=3,
             )
+            support_score = nli_result.entailment
+            contradiction_score = nli_result.contradiction
+            best_citation_id = nli_result.citation_id
+            best_evidence = nli_result.premise
+
             if nli_result.label == "supported":
                 status = "supported"
                 reason = "nli_entailment"
+                support_score = max(support_score, min(local_support, 0.95))
+                if local_support >= SUPPORTED_THRESHOLD:
+                    contradiction_score = min(contradiction_score, 0.35)
             elif nli_result.label == "contradicted":
-                status = "contradicted"
-                reason = "nli_contradiction"
+                condition_alignment = float(local_breakdown.get("condition_alignment") or 0.0)
+                concept = float(local_breakdown.get("concept_coverage") or 0.0)
+                semantic = float(local_breakdown.get("semantic") or 0.0)
+                strong_local_support = (
+                    local_support >= 0.68
+                    and condition_alignment >= 0.5
+                    and (concept >= 0.55 or semantic >= 0.70)
+                )
+                if strong_local_support and nli_result.contradiction < 0.97:
+                    status = "supported" if local_support >= 0.75 and nli_result.contradiction < 0.90 else "weak_support"
+                    reason = "local_evidence_softened_nli_contradiction"
+                    support_score = max(nli_result.entailment, min(local_support, 0.72))
+                    contradiction_score = min(nli_result.contradiction, 0.49)
+                    best_citation_id = local_hit.get("citation_id")
+                    best_evidence = local_best.get("premise_text")
+                else:
+                    status = "contradicted"
+                    reason = "nli_contradiction"
             else:
-                status = "unsupported"
-                reason = "nli_neutral_or_unsupported"
+                if local_support >= 0.68:
+                    status = "supported"
+                    reason = "local_evidence_support_overrode_nli_neutral"
+                    support_score = max(nli_result.entailment, local_support)
+                    contradiction_score = min(nli_result.contradiction, 0.35)
+                    best_citation_id = local_hit.get("citation_id")
+                    best_evidence = local_best.get("premise_text")
+                elif local_support >= WEAK_SUPPORT_THRESHOLD:
+                    status = "weak_support"
+                    reason = "local_evidence_weak_support_after_nli_neutral"
+                    support_score = max(nli_result.entailment, local_support)
+                    contradiction_score = min(nli_result.contradiction, 0.45)
+                    best_citation_id = local_hit.get("citation_id")
+                    best_evidence = local_best.get("premise_text")
+                else:
+                    status = "unsupported"
+                    reason = "nli_neutral_or_unsupported"
+
+            support_breakdown = {
+                "nli_entailment": nli_result.entailment,
+                "nli_contradiction": nli_result.contradiction,
+                "nli_neutral": nli_result.neutral,
+                "local_support": round(local_support, 4),
+            }
+            support_breakdown.update({
+                f"local_{key}": float(value)
+                for key, value in local_breakdown.items()
+            })
 
             results.append(ClaimVerificationResult(
                 claim_id=claim.claim_id,
                 claim=claim.text,
                 status=status,
-                support_score=nli_result.entailment,
-                contradiction_score=nli_result.contradiction,
-                best_citation_id=nli_result.citation_id,
-                best_evidence=nli_result.premise,
+                support_score=round(support_score, 4),
+                contradiction_score=round(contradiction_score, 4),
+                best_citation_id=best_citation_id,
+                best_evidence=best_evidence,
                 reason=reason,
-                support_breakdown={
-                    "nli_entailment": nli_result.entailment,
-                    "nli_contradiction": nli_result.contradiction,
-                    "nli_neutral": nli_result.neutral,
-                },
+                support_breakdown=support_breakdown,
+                matched_concepts=list(local_best.get("matched") or [])[:10],
+                missing_concepts=list(local_best.get("missing") or []),
                 nli=nli_result.to_metadata(),
+                claim_type=claim.claim_type,
+                severity_weight=claim.severity_weight,
             ))
         return results
 
@@ -836,6 +1057,8 @@ class ClinicalClaimVerifier:
             best_evidence=None,
             reason=reason,
             support_breakdown={},
+            claim_type=claim.claim_type,
+            severity_weight=claim.severity_weight,
         )
 
 

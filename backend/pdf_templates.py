@@ -244,6 +244,8 @@ def generate_pdf(report: dict[str, Any]) -> bytes:
     story.append(_key_value_table([
         ("KG Verification", analysis.get("kg")),
         ("NLI Verification", f"{analysis.get('nli')} ({analysis.get('nli_confidence')})"),
+        ("Verification Mode", analysis.get("verification_mode")),
+        ("Claims Verified", f"{_safe(analysis.get('verified_claim_count'))} / {_safe(analysis.get('total_claim_count'))}"),
         ("RAG Verification", f"{analysis.get('rag_score')} | Verified: {_safe(analysis.get('rag_verified'))}"),
         ("RAG Error", analysis.get("rag_error")),
         ("Imaging Verification", analysis.get("imaging")),

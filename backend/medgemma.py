@@ -107,7 +107,7 @@ def _clean_response(text: str) -> str:
         flags=re.DOTALL | re.IGNORECASE,
     )
     text = re.sub(
-        r"^\s*(?:thought|thinking)\s*",
+        r"^\s*(?:thought|thinking)\s*(?:[:\n]|$)",
         "",
         text,
         flags=re.IGNORECASE,
@@ -119,7 +119,6 @@ def _clean_response(text: str) -> str:
         "identify the core question",
         "scan the provided evidence",
         "thinking process",
-        "thought",
         "confidence score:",
         "strategizing complete",
         "self-correction",
@@ -132,7 +131,9 @@ def _clean_response(text: str) -> str:
     cleaned_lines = []
     for line in text.split("\n"):
         lower_line = line.strip().lower()
-        if any(pattern in lower_line for pattern in skip_patterns):
+        if lower_line.rstrip(":") in {"thought", "thinking"}:
+            continue
+        if any(lower_line.startswith(pattern) for pattern in skip_patterns):
             continue
         cleaned_lines.append(line)
 
