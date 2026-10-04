@@ -1,14 +1,17 @@
 import os
 import re
+from io import BytesIO
 from time import perf_counter
 from typing import Any
+from uuid import uuid4
 
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 try:
     from .audit_log import write_audit_event
+    from .case_store import store_case
     from .medgemma import MedGemmaError, generate_response, get_model_status
     from .radiology_analyzer import analyze_image, format_finding_assessment, get_radiology_status
     from .verification import verify_response, get_verification_status
@@ -20,6 +23,7 @@ try:
     from .structured_log import log_event
 except ImportError:
     from audit_log import write_audit_event
+    from case_store import store_case
     from medgemma import MedGemmaError, generate_response, get_model_status
     from radiology_analyzer import analyze_image, format_finding_assessment, get_radiology_status
     from verification import verify_response, get_verification_status
@@ -33,10 +37,28 @@ except ImportError:
 
 app = FastAPI(title="HalluGuard-Med API")
 
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_csv(name: str, default: str = "") -> list[str]:
+    value = os.getenv(name, default)
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+CORS_ALLOW_ORIGINS = _env_csv(
+    "CORS_ALLOW_ORIGINS",
+    "http://127.0.0.1:8000,http://localhost:8000,http://127.0.0.1:5500,http://localhost:5500,http://127.0.0.1:3000,http://localhost:3000",
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=CORS_ALLOW_ORIGINS,
+    allow_credentials=_env_bool("CORS_ALLOW_CREDENTIALS", False),
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -47,10 +69,110 @@ app.include_router(report_router)
 
 
 IMAGE_MEDGEMMA_MAX_NEW_TOKENS = int(os.getenv("IMAGE_MEDGEMMA_MAX_NEW_TOKENS", "256"))
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(10 * 1024 * 1024)))
+MAX_IMAGE_PIXELS = int(os.getenv("MAX_IMAGE_PIXELS", "12000000"))
+ALLOWED_IMAGE_MIME_TYPES = set(_env_csv("ALLOWED_IMAGE_MIME_TYPES", "image/jpeg,image/png,image/webp"))
+ALLOWED_IMAGE_EXTENSIONS = set(_env_csv("ALLOWED_IMAGE_EXTENSIONS", ".jpg,.jpeg,.png,.webp"))
+EMERGENCY_WARNING = (
+    "Urgent safety warning: your message includes symptoms or concerns that can be medical emergencies. "
+    "Seek emergency medical care now or call your local emergency number. "
+    "Do not rely on this AI response to decide whether urgent care is needed."
+)
+RADIOLOGY_SCREENING_WARNING = (
+    "Image safety note: uploaded image analysis is screening-only and cannot confirm or rule out a diagnosis. "
+    "A qualified clinician or radiologist should review the original image."
+)
+RADIOLOGY_MODALITY_WARNING = (
+    "Image modality warning: this system cannot verify that the uploaded image is a valid chest X-ray or the correct view."
+)
+EMERGENCY_PATTERNS = [
+    r"\bchest pain\b",
+    r"\b(stroke|face droop|facial droop|arm weakness|speech difficulty|slurred speech)\b",
+    r"\b(difficulty breathing|shortness of breath|trouble breathing|can't breathe|cannot breathe)\b",
+    r"\b(severe bleeding|uncontrolled bleeding|bleeding heavily)\b",
+    r"\b(severe allergic reaction|anaphylaxis|throat swelling|tongue swelling)\b",
+    r"\b(suicidal thoughts|suicide|self harm|self-harm|want to die)\b",
+]
 INTERNAL_CITATION_RE = re.compile(
     r"\s*\[[A-Z0-9][A-Z0-9_-]{2,}(?:-[A-Z0-9_-]+)*\]",
     re.IGNORECASE,
 )
+
+
+def _validate_upload_metadata(image: UploadFile) -> None:
+    content_type = (image.content_type or "").lower().strip()
+    if content_type not in ALLOWED_IMAGE_MIME_TYPES:
+        raise HTTPException(
+            status_code=415,
+            detail=f"Unsupported image MIME type: {content_type or 'unknown'}",
+        )
+
+    filename = image.filename or ""
+    extension = os.path.splitext(filename)[1].lower()
+    if extension not in ALLOWED_IMAGE_EXTENSIONS:
+        raise HTTPException(
+            status_code=415,
+            detail=f"Unsupported image file extension: {extension or 'none'}",
+        )
+
+
+def _validate_image_pixels(image_bytes: bytes) -> None:
+    try:
+        from PIL import Image
+
+        Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+        with Image.open(BytesIO(image_bytes)) as image:
+            image.verify()
+            width, height = image.size
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Uploaded file is not a valid image.") from exc
+
+    if width <= 0 or height <= 0 or width * height > MAX_IMAGE_PIXELS:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Image dimensions exceed the configured pixel limit of {MAX_IMAGE_PIXELS}.",
+        )
+
+
+async def _read_validated_image(image: UploadFile | None) -> bytes | None:
+    if image is None:
+        return None
+
+    _validate_upload_metadata(image)
+    image_bytes = await image.read(MAX_UPLOAD_BYTES + 1)
+    if len(image_bytes) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Image upload exceeds the configured size limit of {MAX_UPLOAD_BYTES} bytes.",
+        )
+    if not image_bytes:
+        return None
+
+    _validate_image_pixels(image_bytes)
+    return image_bytes
+
+
+def _new_case_id() -> str:
+    return f"HGM-{uuid4().hex[:12].upper()}"
+
+
+def _detect_emergency(query: str) -> dict[str, Any]:
+    matched = [
+        pattern
+        for pattern in EMERGENCY_PATTERNS
+        if re.search(pattern, query or "", re.IGNORECASE)
+    ]
+    return {
+        "detected": bool(matched),
+        "matched_patterns": matched,
+        "warning": EMERGENCY_WARNING if matched else None,
+    }
+
+
+def _prepend_warning(answer: str, warning: str) -> str:
+    if not warning or warning in answer:
+        return answer
+    return f"{warning}\n\n{answer}".strip()
 INTERNAL_CITATION_ID_RE = re.compile(
     r"^[A-Z0-9][A-Z0-9_-]{2,}(?:-[A-Z0-9_-]+)*$",
     re.IGNORECASE,
@@ -280,13 +402,19 @@ async def chat(
 
     # ── Read image ──
     chat_start = perf_counter()
+    case_id = _new_case_id()
+    emergency = _detect_emergency(query)
     chat_timing_ms: dict[str, float] = {}
     image_read_start = perf_counter()
-    image_bytes = await image.read() if image else None
+    image_bytes = await _read_validated_image(image)
     chat_timing_ms["image_upload_read"] = round((perf_counter() - image_read_start) * 1000.0, 2)
     image_uploaded = image_bytes is not None and len(image_bytes) > 0
+    image_warnings = [RADIOLOGY_SCREENING_WARNING, RADIOLOGY_MODALITY_WARNING] if image_uploaded else []
     image_analysis_start = perf_counter()
     imaging_result = analyze_image(image_bytes) if image_uploaded else None
+    if imaging_result is not None:
+        existing_warnings = imaging_result.get("warnings", [])
+        imaging_result["warnings"] = list(dict.fromkeys([*image_warnings, *existing_warnings]))
     chat_timing_ms["image_analysis"] = round((perf_counter() - image_analysis_start) * 1000.0, 2)
     query_build_start = perf_counter()
     retrieval_query = _build_image_augmented_query(query, imaging_result)
@@ -323,6 +451,7 @@ async def chat(
             error=str(exc),
         )
         write_audit_event({
+            "case_id": case_id,
             "query": query,
             "image_uploaded": image_uploaded,
             "model_available": None,
@@ -373,6 +502,8 @@ async def chat(
             generation_image_bytes,
             max_new_tokens=generation_token_limit,
         )
+        if emergency["detected"]:
+            ai_response = _prepend_warning(ai_response, EMERGENCY_WARNING)
         ai_response, citations_appended = _ensure_citation_section(
             ai_response,
             rag_result.get("citations", []),
@@ -395,6 +526,7 @@ async def chat(
             model_status=model_status_data.get("status"),
         )
         write_audit_event({
+            "case_id": case_id,
             "query": query,
             "image_uploaded": image_uploaded,
             "model_available": False,
@@ -437,6 +569,13 @@ async def chat(
         precheck=rag_result.get("safety_precheck", {}),
         imaging_result=imaging_result,
     )
+    post_generation_safety["emergency"] = emergency
+    if image_uploaded:
+        post_generation_safety["radiology_caution"] = {
+            "screening_only": True,
+            "modality_verified": False,
+            "warnings": image_warnings,
+        }
     post_duration_ms = round((perf_counter() - post_start) * 1000.0, 2)
     chat_timing_ms["claim_extraction_and_verification"] = post_duration_ms
     log_event(
@@ -489,6 +628,8 @@ async def chat(
 
     # ── Build full response ──
     result = {
+        "case_id": case_id,
+        "query": query,
         "final_response": ai_response,
         "analysis": {
             "risk_tier": verification["risk_tier"],
@@ -497,6 +638,9 @@ async def chat(
             "final_assessment": verification.get("final_assessment"),
             "kg": verification["kg"],
             "nli": verification["nli"],
+            "verification_mode": verification.get("verification_mode"),
+            "verified_claim_count": verification.get("verified_claim_count"),
+            "total_claim_count": verification.get("total_claim_count"),
             "rag_score": verification["rag_score"],
             "rag_verified": verification["rag_verified"],
             "rag_error": verification["rag_error"],
@@ -530,7 +674,18 @@ async def chat(
     }
 
     # ── Audit log ──
+    if emergency["detected"]:
+        if EMERGENCY_WARNING not in result["warnings"]:
+            result["warnings"].insert(0, EMERGENCY_WARNING)
+        if EMERGENCY_WARNING not in result["suggestions"]:
+            result["suggestions"].insert(0, EMERGENCY_WARNING)
+    if image_uploaded:
+        for warning in image_warnings:
+            if warning not in result["warnings"]:
+                result["warnings"].append(warning)
+
     write_audit_event({
+        "case_id": case_id,
         "query": query,
         "image_uploaded": image_uploaded,
         "model_available": True,
@@ -562,6 +717,7 @@ async def chat(
         imaging_status=imaging_data["status"],
     )
 
+    store_case(case_id, result)
     return _sanitize_user_facing_payload(result)
 
 
