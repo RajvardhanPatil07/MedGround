@@ -2,22 +2,31 @@
 .env.*
 !.env.example
 
-__pycache__/
-*.py[cod]
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-
+*.log
 backend/*.log
-backend/runtime.log
-backend/audit.log
-backend_server*.log
 backend_server.*.log
 
-runtime_artifacts/
-tmp_image_response*.json
+__pycache__/
+*.py[cod]
+.ruff_cache/
 
+runtime_artifacts/
+uploads/
+uploaded_files/
+generated_reports/
+reports/
+*.pdf
+
+tmp_*.json
+frontend.zip
+
+.pytest_cache/
+.mypy_cache/
 .DS_Store
 node_modules/
 dist/
 build/
+venv/
+.venv/
+output/
+tmp/
